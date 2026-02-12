@@ -16,6 +16,10 @@ interface Config {
   pgConnectTimeout: number;
 }
 
+function ensureTrailingSlash(s: string): string {
+  return s.endsWith("/") ? s : `${s}/`;
+}
+
 function loadConfig(): Config {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
@@ -53,11 +57,13 @@ function loadConfig(): Config {
   return {
     databaseUrl,
     s3Bucket,
-    s3Region: process.env.S3_REGION ?? process.env.AWS_REGION ?? "us-east-1",
+    s3Region: process.env.S3_REGION ?? process.env.AWS_REGION ?? "auto",
     s3Endpoint: process.env.S3_ENDPOINT ?? process.env.AWS_ENDPOINT,
     s3AccessKeyId,
     s3SecretAccessKey,
-    backupPrefix: process.env.BACKUP_PREFIX ?? `backups/${dbName}/`,
+    backupPrefix: ensureTrailingSlash(
+      process.env.BACKUP_PREFIX ?? `backups/${dbName}`,
+    ),
     backupMaxCount: parseInt(process.env.BACKUP_MAX_COUNT ?? "30", 10),
     pgConnectTimeout: parseInt(process.env.PG_CONNECT_TIMEOUT ?? "120", 10),
   };
@@ -129,7 +135,7 @@ async function waitForPostgres(
 // pg_dump execution
 // ---------------------------------------------------------------------------
 
-async function runPgDump(databaseUrl: string): Promise<Buffer> {
+async function runPgDump(databaseUrl: string): Promise<Uint8Array> {
   log("Running pg_dump...");
   const startTime = Date.now();
 
@@ -138,12 +144,12 @@ async function runPgDump(databaseUrl: string): Promise<Buffer> {
     .quiet()
     .arrayBuffer();
 
-  const buffer = Buffer.from(result);
+  const bytes = new Uint8Array(result);
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  const sizeMb = (buffer.byteLength / 1024 / 1024).toFixed(2);
+  const sizeMb = (bytes.byteLength / 1024 / 1024).toFixed(2);
   log(`pg_dump completed in ${elapsed}s (${sizeMb} MB compressed)`);
 
-  return buffer;
+  return bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,14 +174,24 @@ function generateS3Key(prefix: string): string {
 async function uploadToS3(
   bucket: S3Client,
   key: string,
-  data: Buffer,
+  data: Uint8Array,
 ): Promise<void> {
-  log(`Uploading to s3://${key} ...`);
+  log(`Uploading to s3://${key} (${(data.byteLength / 1024 / 1024).toFixed(2)} MB)...`);
   const startTime = Date.now();
 
-  await bucket.write(key, data, {
-    type: "application/gzip",
-  });
+  try {
+    await bucket.write(key, data, {
+      type: "application/gzip",
+    });
+  } catch (err) {
+    // Log full error details for debugging S3 issues
+    const error = err as Error;
+    logError(`S3 upload failed for key "${key}"`);
+    logError(`  Message: ${error.message}`);
+    if (error.cause) logError(`  Cause: ${JSON.stringify(error.cause)}`);
+    if (error.stack) logError(`  Stack: ${error.stack}`);
+    throw err;
+  }
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   log(`Upload completed in ${elapsed}s`);
@@ -242,16 +258,16 @@ async function main(): Promise<void> {
   await waitForPostgres(config.databaseUrl, config.pgConnectTimeout);
 
   // 3. Run pg_dump and compress
-  const dumpBuffer = await runPgDump(config.databaseUrl);
+  const dumpData = await runPgDump(config.databaseUrl);
 
-  if (dumpBuffer.byteLength === 0) {
+  if (dumpData.byteLength === 0) {
     throw new Error("pg_dump produced empty output");
   }
 
   // 4. Upload to S3
   const bucket = createS3Client(config);
   const s3Key = generateS3Key(config.backupPrefix);
-  await uploadToS3(bucket, s3Key, dumpBuffer);
+  await uploadToS3(bucket, s3Key, dumpData);
 
   // 5. Cleanup old backups (best-effort – don't fail the run if cleanup fails)
   try {
