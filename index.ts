@@ -1,4 +1,10 @@
-import { S3Client, $ } from "bun";
+import { $ } from "bun";
+import {
+  S3Client,
+  PutObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectCommand,
+} from "@aws-sdk/client-s3";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -153,16 +159,18 @@ async function runPgDump(databaseUrl: string): Promise<Uint8Array> {
 }
 
 // ---------------------------------------------------------------------------
-// S3 upload
+// S3 operations (using @aws-sdk/client-s3 for R2/S3 compatibility)
 // ---------------------------------------------------------------------------
 
 function createS3Client(config: Config): S3Client {
   return new S3Client({
-    bucket: config.s3Bucket,
     region: config.s3Region,
     endpoint: config.s3Endpoint,
-    accessKeyId: config.s3AccessKeyId,
-    secretAccessKey: config.s3SecretAccessKey,
+    credentials: {
+      accessKeyId: config.s3AccessKeyId,
+      secretAccessKey: config.s3SecretAccessKey,
+    },
+    forcePathStyle: true,
   });
 }
 
@@ -172,26 +180,24 @@ function generateS3Key(prefix: string): string {
 }
 
 async function uploadToS3(
-  bucket: S3Client,
+  client: S3Client,
+  bucket: string,
   key: string,
   data: Uint8Array,
 ): Promise<void> {
-  log(`Uploading to s3://${key} (${(data.byteLength / 1024 / 1024).toFixed(2)} MB)...`);
+  log(
+    `Uploading to s3://${bucket}/${key} (${(data.byteLength / 1024 / 1024).toFixed(2)} MB)...`,
+  );
   const startTime = Date.now();
 
-  try {
-    await bucket.write(key, data, {
-      type: "application/gzip",
-    });
-  } catch (err) {
-    // Log full error details for debugging S3 issues
-    const error = err as Error;
-    logError(`S3 upload failed for key "${key}"`);
-    logError(`  Message: ${error.message}`);
-    if (error.cause) logError(`  Cause: ${JSON.stringify(error.cause)}`);
-    if (error.stack) logError(`  Stack: ${error.stack}`);
-    throw err;
-  }
+  await client.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: data,
+      ContentType: "application/gzip",
+    }),
+  );
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   log(`Upload completed in ${elapsed}s`);
@@ -202,14 +208,22 @@ async function uploadToS3(
 // ---------------------------------------------------------------------------
 
 async function cleanupOldBackups(
-  bucket: S3Client,
+  client: S3Client,
+  bucket: string,
   prefix: string,
   maxCount: number,
 ): Promise<void> {
   log(`Checking backup retention (max: ${maxCount})...`);
 
-  const response = await bucket.list({ prefix, maxKeys: 1000 });
-  const contents = response.contents ?? [];
+  const response = await client.send(
+    new ListObjectsV2Command({
+      Bucket: bucket,
+      Prefix: prefix,
+      MaxKeys: 1000,
+    }),
+  );
+
+  const contents = response.Contents ?? [];
 
   if (contents.length <= maxCount) {
     log(
@@ -220,18 +234,24 @@ async function cleanupOldBackups(
 
   // Sort by key ascending (oldest first, since keys contain ISO timestamps)
   const sorted = contents
-    .filter((obj) => obj.key.endsWith(".sql.gz"))
-    .sort((a, b) => a.key.localeCompare(b.key));
+    .filter((obj) => obj.Key?.endsWith(".sql.gz"))
+    .sort((a, b) => (a.Key ?? "").localeCompare(b.Key ?? ""));
 
   const toDelete = sorted.slice(0, sorted.length - maxCount);
   log(`Deleting ${toDelete.length} old backup(s)...`);
 
   for (const obj of toDelete) {
+    if (!obj.Key) continue;
     try {
-      await bucket.delete(obj.key);
-      log(`  Deleted: ${obj.key}`);
+      await client.send(
+        new DeleteObjectCommand({
+          Bucket: bucket,
+          Key: obj.Key,
+        }),
+      );
+      log(`  Deleted: ${obj.Key}`);
     } catch (err) {
-      logError(`  Failed to delete ${obj.key}: ${(err as Error).message}`);
+      logError(`  Failed to delete ${obj.Key}: ${(err as Error).message}`);
     }
   }
 
@@ -251,6 +271,7 @@ async function main(): Promise<void> {
     `Database: ${new URL(config.databaseUrl).hostname}/${new URL(config.databaseUrl).pathname.replace(/^\//, "")}`,
   );
   log(`S3 bucket: ${config.s3Bucket}`);
+  log(`S3 endpoint: ${config.s3Endpoint ?? "(default)"}`);
   log(`Prefix: ${config.backupPrefix}`);
   log(`Retention: ${config.backupMaxCount} backups`);
 
@@ -265,13 +286,18 @@ async function main(): Promise<void> {
   }
 
   // 4. Upload to S3
-  const bucket = createS3Client(config);
+  const s3 = createS3Client(config);
   const s3Key = generateS3Key(config.backupPrefix);
-  await uploadToS3(bucket, s3Key, dumpData);
+  await uploadToS3(s3, config.s3Bucket, s3Key, dumpData);
 
   // 5. Cleanup old backups (best-effort – don't fail the run if cleanup fails)
   try {
-    await cleanupOldBackups(bucket, config.backupPrefix, config.backupMaxCount);
+    await cleanupOldBackups(
+      s3,
+      config.s3Bucket,
+      config.backupPrefix,
+      config.backupMaxCount,
+    );
   } catch (err) {
     logError(`Cleanup failed (non-fatal): ${(err as Error).message}`);
   }
