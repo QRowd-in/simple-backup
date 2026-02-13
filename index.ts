@@ -14,7 +14,7 @@ interface Config {
   databaseUrl: string;
   s3Bucket: string;
   s3Region: string;
-  s3Endpoint: string | undefined;
+  s3Endpoint: string;
   s3AccessKeyId: string;
   s3SecretAccessKey: string;
   backupPrefix: string;
@@ -51,6 +51,14 @@ function loadConfig(): Config {
     );
   }
 
+  const s3Endpoint =
+    process.env.S3_ENDPOINT ?? process.env.AWS_ENDPOINT;
+  if (!s3Endpoint) {
+    throw new Error(
+      "S3_ENDPOINT is required (e.g. https://<account-id>.r2.cloudflarestorage.com for Cloudflare R2)",
+    );
+  }
+
   // Extract database name from the connection URL for the default prefix
   let dbName = "db";
   try {
@@ -64,7 +72,7 @@ function loadConfig(): Config {
     databaseUrl,
     s3Bucket,
     s3Region: process.env.S3_REGION ?? process.env.AWS_REGION ?? "auto",
-    s3Endpoint: process.env.S3_ENDPOINT ?? process.env.AWS_ENDPOINT,
+    s3Endpoint,
     s3AccessKeyId,
     s3SecretAccessKey,
     backupPrefix: ensureTrailingSlash(
@@ -271,7 +279,7 @@ async function main(): Promise<void> {
     `Database: ${new URL(config.databaseUrl).hostname}/${new URL(config.databaseUrl).pathname.replace(/^\//, "")}`,
   );
   log(`S3 bucket: ${config.s3Bucket}`);
-  log(`S3 endpoint: ${config.s3Endpoint ?? "(default)"}`);
+  log(`S3 endpoint: ${config.s3Endpoint}`);
   log(`Prefix: ${config.backupPrefix}`);
   log(`Retention: ${config.backupMaxCount} backups`);
 
