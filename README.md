@@ -13,7 +13,7 @@ A lightweight PostgreSQL backup utility that dumps a database, compresses it wit
 ## Requirements
 
 - Bun runtime
-- `pg_dump` command-line tool (must be installed on the system)
+- `pg_dump` command-line tool, at least as new as the server's major version. An older client aborts with "server version mismatch". The Dockerfile installs `postgresql-client-18` from the PGDG repo; bump `PG_MAJOR` there when the server moves.
 - S3-compatible storage (AWS S3, Cloudflare R2, MinIO, etc.)
 
 ## Installation
@@ -75,7 +75,7 @@ BACKUP_MAX_COUNT=30
 ## How it works
 
 1. **Connect** - Validates configuration and waits for Postgres to be reachable
-2. **Dump** - Runs `pg_dump` to create a SQL dump of the database
+2. **Dump** - Runs `pg_dump` to create a SQL dump of the database. A non-zero exit, or output that is not a dump, fails the run; nothing is uploaded
 3. **Compress** - Compresses the dump with gzip
 4. **Upload** - Uploads the compressed backup to S3 with timestamp in filename
 5. **Cleanup** - Deletes old backups exceeding the retention limit
