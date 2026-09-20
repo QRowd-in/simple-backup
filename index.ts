@@ -149,21 +149,64 @@ async function waitForPostgres(
 // pg_dump execution
 // ---------------------------------------------------------------------------
 
+// A plain-format dump carries this banner in its header comment. Output
+// without it (or no output at all) means pg_dump did not produce a dump.
+const DUMP_BANNER = "-- PostgreSQL database dump";
+const DUMP_HEADER_BYTES = 256;
+
+async function logVersions(databaseUrl: string): Promise<void> {
+  const client = (await $`pg_dump --version`.quiet().text()).trim();
+  const sql = new Bun.SQL(databaseUrl);
+  try {
+    const [row] = await sql<{ server_version: string }[]>`SHOW server_version`;
+    log(`Client: ${client}; server: PostgreSQL ${row?.server_version ?? "unknown"}`);
+  } finally {
+    await sql.close({ timeout: 1 });
+  }
+}
+
+// Runs pg_dump on its own (no shell pipeline, so its exit code is the one we
+// check and its stderr is ours to report) and gzips the result in-process.
 async function runPgDump(databaseUrl: string): Promise<Uint8Array> {
   log("Running pg_dump...");
   const startTime = Date.now();
 
-  // Use { raw: ... } so the URL is not shell-escaped (it contains @, :, etc.)
-  const result = await $`pg_dump ${{ raw: databaseUrl }} | gzip`
-    .quiet()
-    .arrayBuffer();
+  let result: { exitCode: number; stdout: Uint8Array; stderr: Uint8Array };
+  try {
+    result = await $`pg_dump --no-password ${databaseUrl}`.quiet();
+  } catch (err) {
+    // Bun's shell throws a ShellError on a non-zero exit; it carries the
+    // exit code and the captured stderr, which is the reason we want logged.
+    const shellErr = err as { exitCode?: number; stderr?: Uint8Array };
+    const stderr = shellErr.stderr
+      ? new TextDecoder().decode(shellErr.stderr).trim()
+      : "";
+    throw new Error(
+      `pg_dump exited with code ${shellErr.exitCode ?? "?"}: ${stderr || (err as Error).message}`,
+    );
+  }
 
-  const bytes = new Uint8Array(result);
+  const stderr = new TextDecoder().decode(result.stderr).trim();
+  if (stderr) {
+    // pg_dump warnings (e.g. circular FKs) are worth seeing but not fatal.
+    log(`pg_dump stderr: ${stderr}`);
+  }
+
+  const raw = new Uint8Array(result.stdout);
+  const head = new TextDecoder().decode(raw.subarray(0, DUMP_HEADER_BYTES));
+  if (!head.includes(DUMP_BANNER)) {
+    throw new Error(
+      `pg_dump produced no dump (${raw.byteLength} bytes, starts with ${JSON.stringify(head.slice(0, 60))})`,
+    );
+  }
+
+  const gzipped = Bun.gzipSync(raw);
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  const sizeMb = (bytes.byteLength / 1024 / 1024).toFixed(2);
-  log(`pg_dump completed in ${elapsed}s (${sizeMb} MB compressed)`);
+  const rawMb = (raw.byteLength / 1024 / 1024).toFixed(2);
+  const gzMb = (gzipped.byteLength / 1024 / 1024).toFixed(2);
+  log(`pg_dump completed in ${elapsed}s (${rawMb} MB, ${gzMb} MB compressed)`);
 
-  return bytes;
+  return gzipped;
 }
 
 // ---------------------------------------------------------------------------
@@ -285,13 +328,11 @@ async function main(): Promise<void> {
 
   // 2. Wait for Postgres to be reachable (serverless may be sleeping)
   await waitForPostgres(config.databaseUrl, config.pgConnectTimeout);
+  await logVersions(config.databaseUrl);
 
-  // 3. Run pg_dump and compress
+  // 3. Run pg_dump and compress. runPgDump throws on a non-zero exit or an
+  //    output that is not a dump, so an empty upload cannot pass as success.
   const dumpData = await runPgDump(config.databaseUrl);
-
-  if (dumpData.byteLength === 0) {
-    throw new Error("pg_dump produced empty output");
-  }
 
   // 4. Upload to S3
   const s3 = createS3Client(config);
